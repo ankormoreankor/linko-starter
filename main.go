@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -12,7 +13,23 @@ import (
 	"boot.dev/linko/internal/store"
 )
 
-var logger = log.New(os.Stderr, "DEBUG: ", log.LstdFlags)
+func initializeLogger() (*log.Logger, error) {
+	var logger *log.Logger
+
+	file, exists := os.LookupEnv("LINKO_LOG_FILE")
+	if exists {
+		file, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		multiWriter := io.MultiWriter(os.Stderr, file)
+		logger = log.New(multiWriter, "", log.LstdFlags)
+	} else {
+		logger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+
+	return logger, nil
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -27,12 +44,20 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
-	st, err := store.New(dataDir)
+	logger, err := initializeLogger()
+	if err != nil {
+		log.Fatalf("failed to open log file: %v", err)
+		return 1
+
+	}
+
+	st, err := store.New(dataDir, logger)
 	if err != nil {
 		logger.Printf("failed to create store: %v", err)
 		return 1
 	}
-	s := newServer(*st, httpPort, cancel)
+
+	s := newServer(*st, httpPort, cancel, logger)
 	var serverErr error
 	go func() {
 		serverErr = s.start()
