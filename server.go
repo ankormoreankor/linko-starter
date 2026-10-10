@@ -4,25 +4,82 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"boot.dev/linko/internal/store"
 )
 
+const logContextKey contextKey = "log_context"
+
+type LogContext struct {
+	Username string
+	Error    error
+}
+
+type spyReadCloser struct {
+	io.ReadCloser
+	bytesRead int
+}
+
+func (r *spyReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytesRead += n
+	return n, err
+}
+
+type spyResponseWriter struct {
+	http.ResponseWriter
+	bytesWritten int
+	statusCode   int
+}
+
+func (w *spyResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytesWritten += n
+	return n, err
+}
+
+func (w *spyResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r)
+			start := time.Now()
 			host, port, _ := net.SplitHostPort(r.RemoteAddr)
-			logger.Info(
-				"Served request",
+			spyReader := &spyReadCloser{ReadCloser: r.Body}
+			spyWriter := &spyResponseWriter{ResponseWriter: w}
+			logContext := &LogContext{}
+			ctx := context.WithValue(r.Context(), logContextKey, logContext)
+			r = r.WithContext(ctx)
+
+			next.ServeHTTP(spyWriter, r)
+
+			attrs := []any{
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.String("client_ip", net.JoinHostPort(host, port)),
-			)
+				slog.Duration("duration", time.Since(start)),
+				slog.Int("request_body_bytes", spyReader.bytesRead),
+				slog.Int("response_status", spyWriter.statusCode),
+				slog.Int("response_body_bytes", spyWriter.bytesWritten),
+			}
+
+			if logContext.Username != "" {
+				attrs = append(attrs, slog.String("user", logContext.Username))
+			}
+
+			logger.Info("Served request", attrs...)
 
 		})
 	}
